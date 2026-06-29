@@ -5,6 +5,8 @@ import hashlib
 import boto3
 import os
 import time
+import re
+from constants import Constants
 
 # ─── Claude classification prompt ───────────────────────────────────────────
 
@@ -155,6 +157,32 @@ def get_ssm_parameter(name):
         _param_cache[name] = response['Parameter']['Value']
     return _param_cache[name]
 
+def sanitise_body(text):
+    """Remove PII from ticket body before hashing or sending to Claude."""
+
+    # Remove email addresses
+    text = re.sub(
+        r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}',
+        '[email]',
+        text
+    )
+
+    # Remove phone numbers (various formats)
+    text = re.sub(
+        r'[\+]?[(]?[0-9]{3}[)]?[\s\-\.]?[0-9]{3}[\s\-\.]?[0-9]{4,6}',
+        '[phone]',
+        text
+    )
+
+    # Remove credit card numbers (groups of 4 digits)
+    text = re.sub(
+        r'\b(?:\d{4}[\s\-]?){3}\d{4}\b',
+        '[card]',
+        text
+    )
+
+    return text.strip()
+
 # ─── Upstash Redis helpers ───────────────────────────────────────────────────
 
 def upstash_command(url, token, *args):
@@ -186,6 +214,39 @@ def set_cache(url, token, cache_key, value):
     """Cache a classification result for 7 days."""
     upstash_command(url, token, 'SET', cache_key, json.dumps(value), 'EX', 604800)
 
+def is_circuit_open(url, token):
+    """Return True if circuit is open (Claude should not be called)."""
+    result = upstash_command(url, token, 'GET', Constants.CIRCUIT_OPEN_KEY)
+    if result.get('result'):
+        print("Circuit is OPEN — blocking Claude call, returning 503")
+        return True
+    print("Circuit is CLOSED — proceeding with Claude call")
+    return False
+
+def record_failure(url, token):
+    """Increment failure counter. Open circuit if threshold reached."""
+    upstash_command(url, token, 'INCR', Constants.CIRCUIT_FAILURE_KEY)
+    upstash_command(url, token, 'EXPIRE', Constants.CIRCUIT_FAILURE_KEY, Constants.FAILURE_WINDOW_TTL)
+
+    result = upstash_command(url, token, 'GET', Constants.CIRCUIT_FAILURE_KEY)
+    count = int(result.get('result') or 0)
+    print(f"Failure count: {count}/{Constants.FAILURE_THRESHOLD}")
+
+    if count >= Constants.FAILURE_THRESHOLD:
+        upstash_command(url, token, 'SET', Constants.CIRCUIT_OPEN_KEY, '1', 'EX', Constants.CIRCUIT_OPEN_TTL)
+        print(f"CIRCUIT OPENED — blocking all calls for {Constants.CIRCUIT_OPEN_TTL} seconds")
+        publish_metric('CircuitBreakerOpen', 1)
+
+def record_success(url, token):
+    """Reset failure counter on successful Claude call."""
+    result = upstash_command(url, token, 'GET', Constants.CIRCUIT_OPEN_KEY)
+    was_open = bool(result.get('result'))
+
+    upstash_command(url, token, 'DEL', Constants.CIRCUIT_FAILURE_KEY)
+
+    if was_open:
+        print("Circuit CLOSED — Claude recovered")
+        publish_metric('CircuitBreakerClose', 1)
 # ─── Claude API call ─────────────────────────────────────────────────────────
 
 def call_claude(api_key, ticket_body):
@@ -224,6 +285,53 @@ def call_claude(api_key, ticket_body):
                 raw_text = raw_text[4:]
 
         return json.loads(raw_text.strip())
+
+def call_claude_with_retry(api_key, ticket_body):
+    """Call Claude with exponential backoff retry. Max 3 attempts."""
+    last_error = None
+
+    for attempt in range(Constants.MAX_RETRIES):
+        try:
+            print(f"Claude API attempt {attempt + 1}/{Constants.MAX_RETRIES}")
+            start = time.time()
+            result = call_claude(api_key, ticket_body)
+            latency = int((time.time() - start) * 1000)
+            print(f"Claude responded in {latency}ms")
+            publish_metric('ClaudeLatency', latency, unit='Milliseconds')
+            return result
+
+        except Exception as e:
+            last_error = e
+            wait = 2 ** attempt  # 1s, 2s
+
+            if attempt < Constants.MAX_RETRIES - 1:
+                print(f"Attempt {attempt + 1}/{Constants.MAX_RETRIES} failed: {str(e)} — retrying in {wait}s")
+                time.sleep(wait)
+            else:
+                print(f"Attempt {attempt + 1}/{Constants.MAX_RETRIES} failed: {str(e)} — giving up")
+
+    raise last_error
+
+# ─── CloudWatch metrics ───────────────────────────────────────────────────────
+
+def publish_metric(metric_name, value, unit='Count'):
+    """Publish a custom metric to CloudWatch."""
+    try:
+        namespace = os.environ.get('CLOUDWATCH_NAMESPACE', 'TicketClassifier')
+        cw = boto3.client('cloudwatch')
+        cw.put_metric_data(
+            Namespace=namespace,
+            MetricData=[
+                {
+                    'MetricName': metric_name,
+                    'Value': value,
+                    'Unit': unit
+                }
+            ]
+        )
+    except Exception as e:
+        # Never let metric publishing break the main flow
+        print(f"CloudWatch metric error (non-fatal): {str(e)}")
 
 # ─── DynamoDB save ───────────────────────────────────────────────────────────
 
@@ -288,8 +396,11 @@ def lambda_handler(event, context):
             upstash_token = get_ssm_parameter('/ticket-classifier/upstash-redis-token')
             table_name    = os.environ.get('DYNAMODB_TABLE', 'ticket-classifications-dev')
 
+            cleaned_body = sanitise_body(ticket_body)
+            print(f"Sanitised body: {cleaned_body[:100]}")
+
             # Compute cache key — SHA256 of lowercased ticket body
-            cache_key = hashlib.sha256(ticket_body.lower().encode()).hexdigest()[:32]
+            cache_key = hashlib.sha256(cleaned_body.lower().encode()).hexdigest()[:32]
 
             start_time = time.time()
             from_cache = False
@@ -301,11 +412,31 @@ def lambda_handler(event, context):
             if classification:
                 from_cache = True
                 print("Cache HIT — skipping Claude API call")
+                publish_metric('CacheHit', 1)
+
             else:
                 print("Cache MISS — calling Claude API")
-                classification = call_claude(claude_key, ticket_body)
-                set_cache(upstash_url, upstash_token, cache_key, classification)
-                print(f"Claude response: {json.dumps(classification)}")
+                publish_metric('CacheMiss', 1)
+
+                if is_circuit_open(upstash_url, upstash_token):
+                    return response(503, {
+                        'error': 'Classification service temporarily unavailable',
+                        'retry_after': Constants.CIRCUIT_OPEN_TTL
+                    })
+
+                    # Call Claude with retry
+                try:
+                    classification = call_claude_with_retry(claude_key,cleaned_body)
+                    record_success(upstash_url, upstash_token)
+                    set_cache(upstash_url, upstash_token, cache_key, classification)
+
+                except Exception as e:
+                    print(f"All Claude attempts failed: {str(e)}")
+                    record_failure(upstash_url, upstash_token)
+                    publish_metric('ClassificationError', 1)
+                    return response(503, {
+                        'error': 'Classification service temporarily unavailable'
+                    })
 
             latency_ms = int((time.time() - start_time) * 1000)
 
