@@ -98,3 +98,17 @@ jobs:
             exit 1
           fi
           echo "PASSED: /health returned 200"
+
+      - name: Package and deploy Lambda function
+        run: |
+          cd backend/src
+          zip function.zip handler.py
+          aws lambda update-function-code \
+            --function-name ticket-classifier-dev \
+            --zip-file fileb://function.zip \
+            --region ${{ secrets.AWS_REGION }}
+          aws lambda update-function-configuration \
+            --function-name ticket-classifier-dev \
+            --handler handler.lambda_handler \
+            --region ${{ secrets.AWS_REGION }}
+          echo "Lambda deployed"
